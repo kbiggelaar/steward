@@ -1,0 +1,6 @@
+*.db
+*.pid
+*.log
+*.bak
+*.plist
+.DS_Store
