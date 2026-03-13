@@ -375,9 +375,10 @@ people birthdays — upcoming birthdays
 people info \"name\" — person details
 people log \"name\" type \"summary\"
 
+costs — AWS costs last 7 days
 help — this message
 
-Anything else gets queued for next session."
+Anything else is handled by Claude AI."
       ;;
 
     "queue"|"queued")
@@ -411,6 +412,64 @@ print('\n'.join(lines))
           output="No queued messages."
         fi
       fi
+      ;;
+
+    "aws costs"|"costs"|"aws cost")
+      output=$(python3 <<'PYEOF'
+import subprocess, json
+from datetime import datetime, timedelta
+
+today = datetime.now().strftime('%Y-%m-%d')
+week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+
+# Get last 7 days
+result = subprocess.run([
+    'aws', 'ce', 'get-cost-and-usage',
+    '--time-period', f'Start={week_ago},End={today}',
+    '--granularity', 'DAILY',
+    '--metrics', 'UnblendedCost',
+    '--group-by', 'Type=DIMENSION,Key=SERVICE',
+    '--output', 'json'
+], capture_output=True, text=True)
+
+if result.returncode != 0:
+    print(f"Error: {result.stderr[:200]}")
+else:
+    data = json.loads(result.stdout)
+    daily_totals = []
+    service_totals = {}
+    for day in data.get('ResultsByTime', []):
+        date = day['TimePeriod']['Start']
+        day_total = 0
+        for group in day.get('Groups', []):
+            svc = group['Keys'][0]
+            amt = float(group['Metrics']['UnblendedCost']['Amount'])
+            day_total += amt
+            service_totals[svc] = service_totals.get(svc, 0) + amt
+        daily_totals.append((date, day_total))
+
+    week_total = sum(t for _, t in daily_totals)
+    lines = ["AWS Costs (last 7 days)", ""]
+
+    for date, total in daily_totals:
+        d = datetime.strptime(date, '%Y-%m-%d').strftime('%a %d')
+        flag = " (!)" if total > 0.20 else ""
+        lines.append(f"  {d}: ${total:.2f}{flag}")
+
+    lines.append(f"\nWeek total: ${week_total:.2f}")
+    lines.append(f"Daily avg:  ${week_total/max(len(daily_totals),1):.2f}")
+
+    # Top services
+    top = sorted(service_totals.items(), key=lambda x: -x[1])[:5]
+    if top:
+        lines.append("\nTop services:")
+        for svc, amt in top:
+            short = svc.replace('Amazon ', '').replace('AWS ', '')
+            lines.append(f"  {short}: ${amt:.2f}")
+
+    print('\n'.join(lines))
+PYEOF
+      )
       ;;
 
     "ping")
