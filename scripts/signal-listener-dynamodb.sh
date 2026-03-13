@@ -1,13 +1,12 @@
 #!/bin/bash
 # Signal Listener (DynamoDB) — connects to signal-cli daemon SSE endpoint, routes commands
-# Based on signal-listener.sh but uses DynamoDB instead of SQLite for queue storage
-# and PATH-based commands (work, people, habits) instead of direct script paths.
+# Uses DynamoDB for queue storage and PATH-based commands (work, people, habits).
 #
 # Architecture:
 #   - Connects to signal-cli daemon HTTP SSE endpoint
 #   - Parses JSON-RPC notifications for incoming messages
-#   - Routes recognized commands to CLI tools
-#   - Queues unrecognized messages in DynamoDB for next Claude Code session
+#   - Routes recognized commands to CLI tools (fast path)
+#   - Unrecognized messages go to Claude AI via `claude -p` (smart path)
 #   - Sends replies via HTTP JSON-RPC
 
 export HOME="/Users/koenbiggelaar"
@@ -28,6 +27,12 @@ HEALTH_URL="${DAEMON_URL}/api/v1/check"
 # DynamoDB configuration
 DYNAMODB_TABLE="steward"
 AWS_REGION="${AWS_REGION:-us-east-1}"
+
+# Claude AI configuration
+CLAUDE_HANDLER="$HOME/.claude/signal-claude-handler.sh"
+CLAUDE_TIMEOUT=90
+CLAUDE_MODEL="sonnet"
+CLAUDE_MAX_BUDGET="0.50"
 
 # Reconnect delay in seconds
 RECONNECT_DELAY=5
@@ -160,6 +165,66 @@ query_queued_messages() {
     --expression-attribute-values '{":pk": {"S": "SIGNAL_PROCESSED#0"}}' \
     --region "$AWS_REGION" \
     --output json 2>>"$LOG"
+}
+
+# --- Claude AI handler ---
+handle_with_claude() {
+  local message="$1"
+  log "Routing to Claude AI: '${message:0:100}'"
+
+  if [ ! -f "$CLAUDE_HANDLER" ]; then
+    log_error "Claude handler not found: $CLAUDE_HANDLER"
+    return 1
+  fi
+
+  # Run handler as separate script (clean env, avoids nested session detection)
+  local tmp_response
+  tmp_response=$(mktemp)
+
+  log "Starting Claude handler (model: $CLAUDE_MODEL, timeout: ${CLAUDE_TIMEOUT}s)"
+  /bin/bash "$CLAUDE_HANDLER" "$message" "$CLAUDE_MODEL" "$CLAUDE_MAX_BUDGET" < /dev/null > "$tmp_response" 2>>"$LOG" &
+  local claude_pid=$!
+  log "Claude handler started (PID: $claude_pid)"
+
+  # Wait up to CLAUDE_TIMEOUT seconds
+  local waited=0
+  while [ "$waited" -lt "$CLAUDE_TIMEOUT" ] && kill -0 "$claude_pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$claude_pid" 2>/dev/null; then
+    log_error "Claude timed out after ${CLAUDE_TIMEOUT}s — killing"
+    kill "$claude_pid" 2>/dev/null
+    sleep 1
+    kill -9 "$claude_pid" 2>/dev/null
+    rm -f "$tmp_response"
+    return 1
+  fi
+
+  wait "$claude_pid"
+  local exit_code=$?
+
+  local response
+  response=$(cat "$tmp_response")
+  rm -f "$tmp_response"
+
+  if [ $exit_code -ne 0 ]; then
+    log_error "Claude exited with code $exit_code"
+    return 1
+  fi
+
+  if [ -z "$response" ]; then
+    log_error "Claude returned empty response"
+    return 1
+  fi
+
+  # Strip any markdown formatting that Claude might add despite instructions
+  response=$(echo "$response" | sed 's/\*\*//g; s/^## //; s/^# //')
+
+  log "Claude response (${#response} chars)"
+  echo "$response"
+  return 0
 }
 
 # --- Command routing ---
@@ -353,10 +418,17 @@ print('\n'.join(lines))
       ;;
 
     *)
-      # Unrecognized — queue for next session in DynamoDB
-      queue_message "$sender" "$cmd"
-      output="Noted — will pick up in next session."
-      log "Queued message: '$cmd'"
+      # Unrecognized — route to Claude AI
+      local ai_response
+      ai_response=$(handle_with_claude "$cmd")
+      if [ $? -eq 0 ] && [ -n "$ai_response" ]; then
+        output="$ai_response"
+      else
+        # Fallback: queue for next interactive session
+        queue_message "$sender" "$cmd"
+        output="Couldn't process that right now — queued for next session."
+        log "Claude failed, queued message: '$cmd'"
+      fi
       ;;
   esac
 
