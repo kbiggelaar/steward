@@ -27,7 +27,7 @@ HEALTH_URL="${DAEMON_URL}/api/v1/check"
 
 # DynamoDB configuration
 DYNAMODB_TABLE="steward"
-AWS_REGION="${AWS_REGION:-eu-west-1}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
 
 # Reconnect delay in seconds
 RECONNECT_DELAY=5
