@@ -1,6 +1,24 @@
+# Database files (data lives in DynamoDB now)
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Runtime files
 *.pid
 *.log
 *.bak
 *.plist
+
+# macOS
 .DS_Store
+
+# Environment / secrets
+.env
+*.env.local
+
+# Temp files
+/tmp/
+
+# Migration script (one-time use, contains hardcoded paths)
+scripts/migrate-to-dynamodb.sh

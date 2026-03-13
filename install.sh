@@ -1,5 +1,5 @@
 #!/bin/bash
-# Steward Installer
+# Steward Installer — DynamoDB backend
 # Sets up the Steward personal life OS on your machine.
 
 set -e
@@ -7,36 +7,154 @@ set -e
 echo "=== Steward Installer ==="
 echo ""
 
-# --- Determine bin directory ---
+# --- Determine directories ---
 if [ -d "/opt/homebrew/bin" ]; then
   BIN_DIR="/opt/homebrew/bin"
 elif [ -d "/usr/local/bin" ]; then
   BIN_DIR="/usr/local/bin"
 else
   echo "ERROR: Neither /opt/homebrew/bin nor /usr/local/bin found."
-  echo "Please create one of these directories or modify this script."
   exit 1
 fi
 
 STEWARD_DIR="$HOME/.claude"
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)/scripts"
+PROJECT_DIR="$HOME/projects"
+CONFIG_TEMPLATES="$(cd "$(dirname "$0")" && pwd)/config-templates"
+
+# --- Prerequisites check ---
+echo "Checking prerequisites..."
+for cmd in aws python3 jq curl; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "  ERROR: $cmd not found. Please install it first."
+    exit 1
+  fi
+done
+echo "  All prerequisites found."
+
+# --- Check AWS credentials ---
+echo ""
+echo "Checking AWS credentials..."
+AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
+if [ -z "$AWS_ACCOUNT" ]; then
+  echo "  ERROR: AWS credentials not configured. Run 'aws configure' first."
+  exit 1
+fi
+AWS_REGION=$(aws configure get region 2>/dev/null || echo "us-east-1")
+echo "  Account: $AWS_ACCOUNT, Region: $AWS_REGION"
+
+# --- Install boto3 ---
+echo ""
+echo "Ensuring boto3 is installed..."
+if ! python3 -c "import boto3" 2>/dev/null; then
+  pip3 install --user --break-system-packages boto3 2>/dev/null || pip3 install --user boto3 2>/dev/null
+  echo "  boto3 installed."
+else
+  echo "  boto3 already available."
+fi
 
 # --- Create directories ---
-echo "Creating $STEWARD_DIR..."
+echo ""
+echo "Creating directories..."
 mkdir -p "$STEWARD_DIR"
+mkdir -p "$PROJECT_DIR/work"
+echo "  $STEWARD_DIR"
+echo "  $PROJECT_DIR/work"
 
-# --- Prompt for phone number ---
+# --- Prompt for configuration ---
 echo ""
 read -p "Enter your Signal phone number (e.g., +15551234567): " PHONE_NUMBER
 if [ -z "$PHONE_NUMBER" ]; then
-  echo "No phone number provided. Signal integration will need manual configuration."
+  echo "  No phone number provided. Signal integration will need manual configuration."
   PHONE_NUMBER="YOUR_PHONE_NUMBER"
 fi
 
+# --- Create DynamoDB table ---
+echo ""
+echo "Setting up DynamoDB table..."
+TABLE_EXISTS=$(aws dynamodb describe-table --table-name steward 2>/dev/null && echo "yes" || echo "no")
+if [ "$TABLE_EXISTS" = "no" ]; then
+  echo "  Creating DynamoDB table 'steward'..."
+  aws dynamodb create-table \
+    --table-name steward \
+    --attribute-definitions \
+      AttributeName=PK,AttributeType=S \
+      AttributeName=SK,AttributeType=S \
+      AttributeName=GSI1PK,AttributeType=S \
+      AttributeName=GSI1SK,AttributeType=S \
+    --key-schema \
+      AttributeName=PK,KeyType=HASH \
+      AttributeName=SK,KeyType=RANGE \
+    --global-secondary-indexes \
+      '[{
+        "IndexName": "GSI1",
+        "KeySchema": [
+          {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+          {"AttributeName": "GSI1SK", "KeyType": "RANGE"}
+        ],
+        "Projection": {"ProjectionType": "ALL"}
+      }]' \
+    --billing-mode PAY_PER_REQUEST \
+    --tags Key=project,Value=steward > /dev/null
+
+  echo "  Waiting for table to be active..."
+  aws dynamodb wait table-exists --table-name steward
+  echo "  Table created."
+else
+  echo "  Table 'steward' already exists."
+fi
+
+# --- Create S3 config bucket ---
+S3_BUCKET="steward-config-${AWS_ACCOUNT}"
+echo ""
+echo "Setting up S3 config bucket..."
+if aws s3 ls "s3://$S3_BUCKET" 2>/dev/null; then
+  echo "  Bucket $S3_BUCKET already exists."
+else
+  aws s3 mb "s3://$S3_BUCKET" --region "$AWS_REGION" > /dev/null
+  echo "  Created bucket: $S3_BUCKET"
+fi
+
+# --- Pull config from S3 or create from templates ---
+echo ""
+echo "Setting up configuration files..."
+
+pull_or_template() {
+  local filename="$1"
+  local s3_path="s3://$S3_BUCKET/config/$filename"
+  local local_path="$2"
+
+  if aws s3 ls "$s3_path" 2>/dev/null; then
+    aws s3 cp "$s3_path" "$local_path" > /dev/null 2>&1
+    echo "  Pulled from S3: $filename"
+  elif [ -f "$CONFIG_TEMPLATES/${filename}.template" ]; then
+    cp "$CONFIG_TEMPLATES/${filename}.template" "$local_path"
+    echo "  Created from template: $filename (customize it!)"
+  else
+    echo "  WARNING: No S3 config or template found for $filename"
+  fi
+}
+
+pull_or_template "CLAUDE.md" "$PROJECT_DIR/CLAUDE.md"
+pull_or_template "UPEKHA.md" "$PROJECT_DIR/UPEKHA.md"
+pull_or_template "steward-persona.md" "$STEWARD_DIR/steward-persona.md"
+
 # --- Copy scripts ---
 echo ""
-echo "Copying scripts to $STEWARD_DIR..."
-for script in work.sh people.sh habits.sh signal-listener.sh signal-send.sh signal-ctl.sh daily-check.sh midday-check.sh evening-check.sh; do
+echo "Installing scripts..."
+SCRIPT_MAP=(
+  "work-dynamodb.sh"
+  "people-dynamodb.sh"
+  "habits-dynamodb.sh"
+  "signal-listener-dynamodb.sh"
+  "signal-send.sh"
+  "signal-ctl.sh"
+  "daily-check-dynamodb.sh"
+  "midday-check-dynamodb.sh"
+  "evening-check-dynamodb.sh"
+)
+
+for script in "${SCRIPT_MAP[@]}"; do
   if [ -f "$SCRIPTS_DIR/$script" ]; then
     cp "$SCRIPTS_DIR/$script" "$STEWARD_DIR/$script"
     chmod +x "$STEWARD_DIR/$script"
@@ -46,209 +164,57 @@ for script in work.sh people.sh habits.sh signal-listener.sh signal-send.sh sign
   fi
 done
 
-# --- Write phone number into scripts ---
+# Also copy non-DynamoDB scripts that don't need migration
+for script in signal-send.sh signal-ctl.sh; do
+  if [ -f "$SCRIPTS_DIR/$script" ]; then
+    cp "$SCRIPTS_DIR/$script" "$STEWARD_DIR/$script"
+    chmod +x "$STEWARD_DIR/$script"
+  fi
+done
+
+# --- Create symlinks ---
+echo ""
+echo "Creating symlinks in $BIN_DIR..."
+declare -A LINK_MAP=(
+  [work]="work-dynamodb.sh"
+  [people]="people-dynamodb.sh"
+  [habits]="habits-dynamodb.sh"
+  [signal-ctl]="signal-ctl.sh"
+)
+
+for cmd in "${!LINK_MAP[@]}"; do
+  script="${LINK_MAP[$cmd]}"
+  target="$STEWARD_DIR/$script"
+  link="$BIN_DIR/$cmd"
+  if [ -L "$link" ] || [ -f "$link" ]; then
+    echo "  $cmd already exists at $link — updating"
+    ln -sf "$target" "$link"
+  else
+    ln -s "$target" "$link"
+  fi
+  echo "  Linked: $cmd -> $script"
+done
+
+# --- Configure phone number ---
 if [ "$PHONE_NUMBER" != "YOUR_PHONE_NUMBER" ]; then
   echo ""
   echo "Configuring phone number..."
-  # Add STEWARD_PHONE to shell profile
   SHELL_RC="$HOME/.zshrc"
-  if [ ! -f "$SHELL_RC" ]; then
-    SHELL_RC="$HOME/.bashrc"
-  fi
+  [ ! -f "$SHELL_RC" ] && SHELL_RC="$HOME/.bashrc"
   if ! grep -q "STEWARD_PHONE" "$SHELL_RC" 2>/dev/null; then
     echo "" >> "$SHELL_RC"
     echo "# Steward phone number for Signal integration" >> "$SHELL_RC"
     echo "export STEWARD_PHONE=\"$PHONE_NUMBER\"" >> "$SHELL_RC"
     echo "  Added STEWARD_PHONE to $SHELL_RC"
-  else
-    echo "  STEWARD_PHONE already in $SHELL_RC"
   fi
-  export STEWARD_PHONE="$PHONE_NUMBER"
 fi
 
-# --- Create symlinks ---
-echo ""
-echo "Creating symlinks in $BIN_DIR..."
-for cmd in work people habits signal-ctl; do
-  script="${cmd}.sh"
-  if [ "$cmd" = "signal-ctl" ]; then
-    script="signal-ctl.sh"
-  fi
-  target="$STEWARD_DIR/$script"
-  link="$BIN_DIR/$cmd"
-  if [ -L "$link" ] || [ -f "$link" ]; then
-    echo "  $cmd already exists at $link — skipping (remove manually to update)"
-  else
-    ln -s "$target" "$link"
-    echo "  Linked: $cmd -> $target"
-  fi
-done
-
-# --- Initialize SQLite database ---
-DB="$STEWARD_DIR/activity.db"
-echo ""
-echo "Initializing SQLite database at $DB..."
-
-sqlite3 "$DB" << 'EOSQL'
--- Activity log
-CREATE TABLE IF NOT EXISTS activity_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  timestamp TEXT DEFAULT (datetime('now','localtime')),
-  project TEXT,
-  category TEXT,
-  activity TEXT,
-  duration_min INTEGER DEFAULT 0,
-  notes TEXT
-);
-
--- Projects
-CREATE TABLE IF NOT EXISTS projects (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  institution TEXT,
-  description TEXT,
-  status TEXT DEFAULT 'active',
-  target_date TEXT,
-  created TEXT DEFAULT (datetime('now','localtime')),
-  updated TEXT DEFAULT (datetime('now','localtime'))
-);
-
--- Actions (tasks within projects)
-CREATE TABLE IF NOT EXISTS actions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id INTEGER REFERENCES projects(id),
-  description TEXT NOT NULL,
-  status TEXT DEFAULT 'open',
-  owner TEXT,
-  due_date TEXT,
-  waiting_on TEXT,
-  notes TEXT,
-  created TEXT DEFAULT (datetime('now','localtime')),
-  updated TEXT DEFAULT (datetime('now','localtime')),
-  completed TEXT
-);
-
--- Action status history
-CREATE TABLE IF NOT EXISTS action_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  action_id INTEGER REFERENCES actions(id),
-  old_status TEXT,
-  new_status TEXT,
-  note TEXT,
-  timestamp TEXT DEFAULT (datetime('now','localtime'))
-);
-
--- People
-CREATE TABLE IF NOT EXISTS people (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  context TEXT,
-  relationship TEXT,
-  contact_method TEXT,
-  contact_frequency_days INTEGER DEFAULT 30,
-  birthday TEXT,
-  notes TEXT,
-  archived INTEGER DEFAULT 0,
-  added_at TEXT DEFAULT (datetime('now','localtime'))
-);
-
--- Interactions
-CREATE TABLE IF NOT EXISTS interactions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  person_id INTEGER REFERENCES people(id),
-  type TEXT,
-  direction TEXT DEFAULT 'outgoing',
-  summary TEXT,
-  follow_up TEXT,
-  timestamp TEXT DEFAULT (datetime('now','localtime'))
-);
-
--- Habits
-CREATE TABLE IF NOT EXISTS habits (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  rule TEXT,
-  frequency TEXT DEFAULT 'daily',
-  target_per_week INTEGER DEFAULT 7,
-  status TEXT DEFAULT 'active',
-  started TEXT DEFAULT (date('now','localtime'))
-);
-
--- Habit log
-CREATE TABLE IF NOT EXISTS habit_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  habit_id INTEGER REFERENCES habits(id),
-  date TEXT NOT NULL,
-  done TEXT NOT NULL,
-  note TEXT,
-  logged_at TEXT DEFAULT (datetime('now','localtime')),
-  UNIQUE(habit_id, date)
-);
-
--- Signal queue
-CREATE TABLE IF NOT EXISTS signal_queue (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  sender TEXT,
-  message TEXT,
-  received_at TEXT DEFAULT (datetime('now','localtime')),
-  processed INTEGER DEFAULT 0,
-  processed_at TEXT,
-  response TEXT
-);
-
--- Reading log
-CREATE TABLE IF NOT EXISTS reading_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  url TEXT,
-  type TEXT DEFAULT 'article',
-  tags TEXT,
-  reflection TEXT,
-  read_date TEXT DEFAULT (date('now','localtime')),
-  added_at TEXT DEFAULT (datetime('now','localtime'))
-);
-
--- View: people who need attention
-CREATE VIEW IF NOT EXISTS v_reach_out AS
-SELECT
-  p.name,
-  p.context,
-  p.relationship,
-  p.contact_method,
-  CAST(julianday('now','localtime') - julianday(COALESCE(MAX(i.timestamp), p.added_at)) AS INTEGER) as days_since,
-  p.contact_frequency_days - CAST(julianday('now','localtime') - julianday(COALESCE(MAX(i.timestamp), p.added_at)) AS INTEGER) as days_until_due,
-  p.notes
-FROM people p
-LEFT JOIN interactions i ON i.person_id = p.id
-WHERE p.archived = 0
-GROUP BY p.id
-HAVING days_until_due <= 7
-ORDER BY days_until_due ASC;
-
--- View: upcoming birthdays
-CREATE VIEW IF NOT EXISTS v_upcoming_dates AS
-SELECT
-  name,
-  birthday,
-  CASE
-    WHEN strftime('%m-%d', 'now', 'localtime') <= substr(birthday, -5)
-    THEN CAST(julianday(strftime('%Y', 'now', 'localtime') || '-' || substr(birthday, -5)) - julianday('now', 'localtime') AS INTEGER)
-    ELSE CAST(julianday(strftime('%Y', 'now', 'localtime', '+1 year') || '-' || substr(birthday, -5)) - julianday('now', 'localtime') AS INTEGER)
-  END as days_until
-FROM people
-WHERE birthday IS NOT NULL AND archived = 0
-HAVING days_until <= 14
-ORDER BY days_until ASC;
-EOSQL
-
-echo "  Database initialized with all tables and views."
-
-# --- Create template LaunchAgent plists ---
+# --- Create LaunchAgent plists ---
 PLIST_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$PLIST_DIR"
 
 echo ""
-echo "Creating template LaunchAgent plists in $PLIST_DIR..."
+echo "Creating LaunchAgent plists..."
 
 # Morning check-in (8:00 AM)
 cat > "$PLIST_DIR/com.steward.daily-check.plist" << EOF
@@ -261,7 +227,7 @@ cat > "$PLIST_DIR/com.steward.daily-check.plist" << EOF
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>${STEWARD_DIR}/daily-check.sh</string>
+    <string>${STEWARD_DIR}/daily-check-dynamodb.sh</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -289,7 +255,7 @@ cat > "$PLIST_DIR/com.steward.midday-check.plist" << EOF
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>${STEWARD_DIR}/midday-check.sh</string>
+    <string>${STEWARD_DIR}/midday-check-dynamodb.sh</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -317,7 +283,7 @@ cat > "$PLIST_DIR/com.steward.evening-check.plist" << EOF
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>${STEWARD_DIR}/evening-check.sh</string>
+    <string>${STEWARD_DIR}/evening-check-dynamodb.sh</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -345,7 +311,7 @@ cat > "$PLIST_DIR/com.steward.signal-listener.plist" << EOF
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>${STEWARD_DIR}/signal-listener.sh</string>
+    <string>${STEWARD_DIR}/signal-listener-dynamodb.sh</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -355,11 +321,6 @@ cat > "$PLIST_DIR/com.steward.signal-listener.plist" << EOF
   <string>${STEWARD_DIR}/signal-listener.log</string>
   <key>StandardErrorPath</key>
   <string>${STEWARD_DIR}/signal-listener.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>STEWARD_PHONE</key>
-    <string>${PHONE_NUMBER}</string>
-  </dict>
 </dict>
 </plist>
 EOF
@@ -373,32 +334,33 @@ echo "  Created: com.steward.signal-listener.plist (always-on)"
 echo ""
 echo "=== Installation Complete ==="
 echo ""
+echo "Architecture:"
+echo "  Data:    DynamoDB table 'steward' ($AWS_REGION)"
+echo "  Config:  S3 bucket '$S3_BUCKET'"
+echo "  Scripts: $STEWARD_DIR"
+echo "  CLIs:    work, people, habits, signal-ctl"
+echo ""
 echo "Next steps:"
 echo ""
-echo "1. Reload your shell:  source ~/.zshrc  (or ~/.bashrc)"
+echo "1. Reload your shell:  source ~/.zshrc"
 echo ""
 echo "2. Test CLIs:"
 echo "   work help"
 echo "   people help"
 echo "   habits help"
 echo ""
-echo "3. Set up Signal (if using Signal integration):"
+echo "3. Customize config files:"
+echo "   $PROJECT_DIR/CLAUDE.md"
+echo "   $PROJECT_DIR/UPEKHA.md"
+echo "   $STEWARD_DIR/steward-persona.md"
+echo ""
+echo "4. Set up Signal (optional):"
 echo "   a. Install signal-cli: brew install signal-cli"
-echo "   b. Register/link your phone number with signal-cli"
+echo "   b. Register/link your phone number"
 echo "   c. Start: signal-ctl start"
 echo ""
-echo "4. Enable LaunchAgents (for automated check-ins):"
+echo "5. Enable LaunchAgents (for automated check-ins):"
 echo "   launchctl load ~/Library/LaunchAgents/com.steward.daily-check.plist"
 echo "   launchctl load ~/Library/LaunchAgents/com.steward.midday-check.plist"
 echo "   launchctl load ~/Library/LaunchAgents/com.steward.evening-check.plist"
 echo "   launchctl load ~/Library/LaunchAgents/com.steward.signal-listener.plist"
-echo ""
-echo "5. Create a steward-persona.md in ~/.claude/ for AI check-in personality."
-echo "   This file is read by the morning/midday/evening check-in scripts."
-echo ""
-echo "6. Create a work/ directory in your projects folder for status.md and habits.md:"
-echo "   mkdir -p ~/projects/work"
-echo ""
-echo "Data is stored in: $DB"
-echo "Scripts are in:    $STEWARD_DIR"
-echo "Logs will be at:   $STEWARD_DIR/cron.log"

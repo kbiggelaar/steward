@@ -1,16 +1,51 @@
 # Steward
 
-A personal AI-powered life operating system built on SQLite, bash, Signal, and Claude Code.
+A personal AI-powered life operating system built on DynamoDB, bash, Signal, and Claude Code.
 
 Steward is an opinionated system for managing projects, actions, people, habits, and daily accountability — all from your terminal or phone via Signal.
 
 ## Architecture
 
-- **Database**: SQLite (single file, all tables)
+- **Database**: AWS DynamoDB (single-table design, pay-per-request)
+- **Config storage**: AWS S3 (personal config files, separate from code)
 - **CLIs**: Bash scripts for work/project tracking, relationship management, habit tracking
 - **Signal Integration**: Bidirectional messaging via signal-cli HTTP daemon + SSE
-- **AI Backbone**: Claude Code for interactive sessions, `claude -p` for headless/one-shot responses
+- **AI Backbone**: Claude Code for interactive sessions, `claude -p` for headless check-ins
 - **Check-ins**: Automated morning/midday/evening accountability via LaunchAgents (macOS)
+
+### Data separation
+
+```
+GitHub (this repo)             S3 (your config)             DynamoDB (your data)
+──────────────────             ────────────────             ──────────────────
+scripts/                       CLAUDE.md                    single table: steward
+config-templates/              UPEKHA.md                    all entities via PK/SK
+install.sh                     steward-persona.md           GSI1 for cross-queries
+docs/
+README.md
+```
+
+- **This repo**: shareable framework — no personal data
+- **S3**: your personal config files, pulled during install
+- **DynamoDB**: all structured data, accessible from any device
+
+### DynamoDB single-table design
+
+| Entity | PK | SK |
+|--------|----|----|
+| Project | `PROJECT#id` | `META` |
+| Action | `PROJECT#id` | `ACTION#id` |
+| Action Log | `ACTION#id` | `LOG#timestamp#id` |
+| Person | `PERSON#id` | `META` |
+| Interaction | `PERSON#id` | `INT#timestamp#id` |
+| Activity | `ACTIVITY` | `timestamp#id` |
+| Habit | `HABIT#id` | `META` |
+| Habit Log | `HABIT#id` | `LOG#date` |
+| Signal Queue | `SIGNAL` | `MSG#id` |
+| Reading | `READING` | `ENTRY#id` |
+| Counter | `COUNTER` | `entity_name` |
+
+GSI1 enables cross-partition queries (e.g., all open actions, all active people).
 
 ## Features
 
@@ -20,15 +55,16 @@ Steward is an opinionated system for managing projects, actions, people, habits,
 - **Signal**: Send commands from your phone (`habits today`, `work overdue`, `people due`), get instant responses
 - **Accountability**: Automated daily check-ins that review what moved, what didn't, and what's next
 - **Reading log**: Track articles/papers with reflections and monthly summaries
+- **Multi-device**: DynamoDB backend means any device with AWS credentials can read/write
 
 ## Prerequisites
 
 - macOS (uses LaunchAgents for scheduling)
-- sqlite3
-- python3
+- AWS CLI + credentials (IAM user with DynamoDB + S3 access)
+- python3 + boto3
+- jq
 - signal-cli >= 0.14.0 (for Signal integration)
-- Claude CLI (for AI-powered check-ins and responses)
-- bash/zsh
+- Claude CLI (for AI-powered check-ins)
 
 ## Quick Start
 
@@ -37,6 +73,12 @@ git clone https://github.com/YOUR_USER/steward.git
 cd steward
 ./install.sh
 ```
+
+The installer will:
+1. Create a DynamoDB table (`steward`) and S3 config bucket
+2. Pull personal config from S3 (or create from templates)
+3. Install CLI scripts and create symlinks
+4. Set up LaunchAgent plists for automated check-ins
 
 ## CLI Reference
 
@@ -74,13 +116,20 @@ Send any of these from Signal:
 - `ping` / `help` / `status`
 - Anything else gets queued for next session
 
+## Cost
+
+At typical personal usage (~100-500 DynamoDB requests/day):
+- **DynamoDB**: Free tier covers 25 RCU + 25 WCU. On-demand: ~$0.01-0.05/day
+- **S3**: ~$0.01/month (a few KB of config files)
+- **Total**: Under $2/month
+
 ## Philosophy
 
-Steward is built on a few principles:
-- **Local-first**: Your data lives on your machine in a single SQLite file
+- **Cloud-native**: Your data syncs across devices via DynamoDB
 - **Shell scripts over frameworks**: Simple, readable, modifiable
 - **AI as steward, not assistant**: It tracks commitments, names what's stalled, and pushes back
 - **Practice-integrated**: Designed for people who take inner work seriously alongside outer work
+- **Data separation**: Personal data never touches the repo
 
 ## Built with
 
